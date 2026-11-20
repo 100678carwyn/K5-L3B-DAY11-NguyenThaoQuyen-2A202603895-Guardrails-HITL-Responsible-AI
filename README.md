@@ -1,3 +1,24 @@
+# Bài nộp Day 11 — Guardrails, HITL & Responsible AI
+
+- **Họ tên:** Nguyễn Thảo Quyên
+- **MSSV:** 2A202603895
+- **Lớp:** K5 — L3B
+- **Bonus chọn:** B1 (leak Red: 3/5 prompt)
+
+## Cách chạy
+
+```bash
+python -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+cp .env.example .env        # điền OPENROUTER_API_KEY + GOOGLE_API_KEY (RED_TEAM_PROVIDER=gemini)
+python src/main.py --part 2 # CP2 — test guardrails
+python src/main.py --part 3 # CP3 — sinh outputs/results.json
+python src/main.py --part 4 # CP4 — sinh outputs/attack_results.json
+python scripts/grade.py     # CP5 — sinh grade_report.json + lab_report.md
+```
+
+---
+
 # Day 11 — Controlled Agent Security (2026)
 
 > 👤 **Hình thức:** bài tập **cá nhân** (1 người / 1 MSSV).  

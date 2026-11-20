@@ -12,6 +12,7 @@ from google.adk.agents import llm_agent
 from google.adk import runners
 from google.adk.plugins import base_plugin
 
+from core.config import DEFAULT_GEMINI_MODEL, DEMO_SECRETS
 from core.utils import chat_with_agent
 
 
@@ -40,13 +41,13 @@ def content_filter(response: str) -> dict:
     redacted = response
 
     # PII patterns to check
+    # Order matters: specific/secret patterns first, generic digit patterns last.
     PII_PATTERNS = {
-        # TODO: Add regex patterns for:
-        # - VN phone number: r"0\d{9,10}"
-        # - Email: r"[\w.-]+@[\w.-]+\.[a-zA-Z]{2,}"
-        # - National ID (CMND/CCCD): r"\b\d{9}\b|\b\d{12}\b"
-        # - API key pattern: r"sk-[a-zA-Z0-9-]+"
-        # - Password pattern: r"password\s*[:=]\s*\S+"
+        "api_key": r"\bsk-[a-zA-Z0-9-]+",
+        "password": r"password\s*(?:is|[:=])\s*\S+",
+        "email": r"[\w.-]+@[\w.-]+\.[a-zA-Z]{2,}",
+        "vn_phone": r"(?<!\d)0\d{9,10}(?!\d)",
+        "national_id": r"(?<!\d)(?:\d{12}|\d{9})(?!\d)",
     }
 
     for name, pattern in PII_PATTERNS.items():
@@ -54,6 +55,12 @@ def content_filter(response: str) -> dict:
         if matches:
             issues.append(f"{name}: {len(matches)} found")
             redacted = re.sub(pattern, "[REDACTED]", redacted, flags=re.IGNORECASE)
+
+    # Exact-match leak check for the lab's known secrets (host names, keys...).
+    for secret in DEMO_SECRETS:
+        if secret and secret.lower() in redacted.lower():
+            issues.append("known_secret: 1 found")
+            redacted = re.sub(re.escape(secret), "[REDACTED]", redacted, flags=re.IGNORECASE)
 
     return {
         "safe": len(issues) == 0,
@@ -89,15 +96,11 @@ Respond with ONLY one word: SAFE or UNSAFE
 If UNSAFE, add a brief reason on the next line.
 """
 
-# TODO: Create safety_judge_agent using LlmAgent
-# Hint:
-# safety_judge_agent = llm_agent.LlmAgent(
-#     model="gemini-3.5-flash",
-#     name="safety_judge",
-#     instruction=SAFETY_JUDGE_INSTRUCTION,
-# )
-
-safety_judge_agent = None  # TODO: Replace with implementation
+safety_judge_agent = llm_agent.LlmAgent(
+    model=DEFAULT_GEMINI_MODEL,
+    name="safety_judge",
+    instruction=SAFETY_JUDGE_INSTRUCTION,
+)
 judge_runner = None
 
 
@@ -172,16 +175,32 @@ class OutputGuardrailPlugin(base_plugin.BasePlugin):
         if not response_text:
             return llm_response
 
-        # TODO: Implement logic:
-        # 1. Call content_filter(response_text)
-        #    - If issues found: replace llm_response.content with redacted version
-        #    - Increment self.redacted_count
-        # 2. If use_llm_judge: call llm_safety_check(response_text)
-        #    - If unsafe: replace llm_response.content with a safe message
-        #    - Increment self.blocked_count
-        # 3. Return llm_response (possibly modified)
+        # 1. Regex layer: redact PII / secrets
+        result = content_filter(response_text)
+        if not result["safe"]:
+            self.redacted_count += 1
+            response_text = result["redacted"]
+            llm_response.content = types.Content(
+                role="model", parts=[types.Part.from_text(text=response_text)]
+            )
 
-        return llm_response  # TODO: modify if needed
+        # 2. LLM-as-Judge layer: catch what regex cannot (harmful, hallucinated...)
+        if self.use_llm_judge:
+            try:
+                verdict = await llm_safety_check(response_text)
+            except Exception:
+                verdict = {"safe": True, "verdict": "judge error — skipped"}
+            if not verdict["safe"]:
+                self.blocked_count += 1
+                llm_response.content = types.Content(
+                    role="model",
+                    parts=[types.Part.from_text(
+                        text="Sorry, I can't share that response. "
+                             "Please ask me another banking question."
+                    )],
+                )
+
+        return llm_response
 
 
 # ============================================================

@@ -11,6 +11,7 @@ Status convention (không dùng True/False mơ hồ):
 from __future__ import annotations
 
 import re
+import unicodedata
 from typing import Literal
 
 from google.genai import types
@@ -21,6 +22,20 @@ from core.config import ALLOWED_TOPICS, BLOCKED_TOPICS
 
 # Quyết định rõ ràng — tránh đảo nghĩa True/False
 InputStatus = Literal["ALLOW", "BLOCK"]
+
+
+def _canonicalize(text: str) -> str:
+    """NFKC-normalize, drop invisible/format chars (zero-width, bidi...), collapse spaces."""
+    text = unicodedata.normalize("NFKC", text or "")
+    text = "".join(ch for ch in text if unicodedata.category(ch) != "Cf")
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _strip_diacritics(text: str) -> str:
+    """Remove Vietnamese/Latin diacritics so 'tài khoản' matches 'tai khoan'."""
+    text = text.replace("đ", "d").replace("Đ", "D")
+    decomposed = unicodedata.normalize("NFD", text)
+    return "".join(ch for ch in decomposed if unicodedata.category(ch) != "Mn")
 
 
 # ============================================================
@@ -52,14 +67,33 @@ def detect_injection(user_input: str) -> InputStatus:
         ``"BLOCK"`` if injection detected (chặn), ``"ALLOW"`` otherwise (cho qua).
     """
     INJECTION_PATTERNS = [
-        # TODO: Add at least 5 regex patterns
-        # Example:
-        # r"ignore (all )?(previous|above) instructions",
+        r"(ignore|disregard|forget|override)\s+(all\s+)?(the\s+|your\s+|my\s+)?"
+        r"(previous|prior|above|earlier|preceding)?\s*(instructions|rules|guidelines|directives)",
+        r"you\s+are\s+now\b",
+        r"system\s+prompt",
+        r"reveal\s+(your|the)\s+(instructions|prompt|rules|configuration)",
+        r"(show|print|repeat|leak|expose)\s+(me\s+)?(your|the)\s+(hidden\s+)?(instructions|prompt)",
+        r"pretend\s+(you\s+are|to\s+be)",
+        r"act\s+as\s+(a\s+|an\s+)?unrestricted",
+        r"\b(DAN|jailbreak|developer\s+mode)\b",
+        r"(bo\s+qua|quen)\s+(tat\s+ca\s+)?(cac\s+)?(huong\s+dan|chi\s+thi)",
+        r"(admin|root|internal)\s+(password|credentials?)",
+        r"(api[\s_-]?key|secret)\s+(is|=|:)",
+        r"\b(drop|truncate|delete\s+from|insert\s+into|union\s+select)\b.*\b(table|from|into|select)\b|\bselect\b.+\bfrom\b.+(--|;)",
     ]
 
-    for pattern in INJECTION_PATTERNS:
-        if re.search(pattern, user_input, re.IGNORECASE):
-            return "BLOCK"
+    # Canonicalize (kills zero-width tricks) and also a diacritic-free copy
+    # for Vietnamese variants. Works on external email/RAG text too: the
+    # *instruction* is matched, not the fact that the data is external.
+    canonical = _canonicalize(user_input)
+    candidates = {canonical, _strip_diacritics(canonical)}
+    # Defeat letter-spacing tricks like "i g n o r e"
+    candidates.add(re.sub(r"(?<=\b\w) (?=\w\b)", "", canonical))
+
+    for candidate in candidates:
+        for pattern in INJECTION_PATTERNS:
+            if re.search(pattern, candidate, re.IGNORECASE):
+                return "BLOCK"
     return "ALLOW"
 
 
@@ -84,14 +118,18 @@ def topic_filter(user_input: str) -> InputStatus:
         ``"BLOCK"`` = chặn (off-topic hoặc topic cấm).
         ``"ALLOW"`` = cho qua (câu banking hợp lệ).
     """
-    input_lower = user_input.lower()
+    input_lower = _strip_diacritics(_canonicalize(user_input)).lower()
 
-    # TODO: Implement logic:
-    # 1. If input contains any blocked topic -> return "BLOCK"
-    # 2. If input doesn't contain any allowed topic -> return "BLOCK"
-    # 3. Otherwise -> return "ALLOW"
+    def _contains(topic: str) -> bool:
+        # Leading word boundary avoids false hits ("skill" != "kill");
+        # no trailing boundary so plurals/inflections match ("loans").
+        return re.search(r"\b" + re.escape(topic), input_lower) is not None
 
-    pass  # Replace with your implementation
+    if any(_contains(t) for t in BLOCKED_TOPICS):
+        return "BLOCK"
+    if not any(_contains(t) for t in ALLOWED_TOPICS):
+        return "BLOCK"
+    return "ALLOW"
 
 
 # ============================================================
@@ -144,14 +182,21 @@ class InputGuardrailPlugin(base_plugin.BasePlugin):
         self.total_count += 1
         text = self._extract_text(user_message)
 
-        # TODO: Implement logic:
-        # 1. Call detect_injection(text)
-        #    - If "BLOCK": increment blocked_count, return self._block_response("...")
-        # 2. Call topic_filter(text)
-        #    - If "BLOCK": increment blocked_count, return self._block_response("...")
-        # 3. If both return "ALLOW": return None (let message through)
+        if detect_injection(text) == "BLOCK":
+            self.blocked_count += 1
+            return self._block_response(
+                "Your request was blocked because it looks like a prompt injection "
+                "attempt. I can only help with VinBank banking questions."
+            )
 
-        pass  # Replace with your implementation
+        if topic_filter(text) == "BLOCK":
+            self.blocked_count += 1
+            return self._block_response(
+                "Sorry, I can only help with banking topics such as accounts, "
+                "transactions, loans, savings and interest rates."
+            )
+
+        return None
 
 
 # ============================================================
